@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# paperflow v0.9
+set -euo pipefail
+
+# ===== 固定パス（必要なら環境変数で上書き） =====
+PPT_PYTHON="${PAPERFLOW_PPT_PYTHON:-/home/ryohei/miniconda3/bin/python}"
+PAPIS_BIN="${PAPERFLOW_PAPIS_BIN:-/home/ryohei/miniconda3/envs/papis_env/bin/papis}"
+PAPIS_PYTHON="${PAPERFLOW_PAPIS_PYTHON:-/home/ryohei/miniconda3/envs/papis_env/bin/python}"
+
+# ---- 既定の場所（-l指定で後から切替） ----
+INBOX_MD_BASE="${HOME}/papers_inbox"
+PPT_OUTDIR_BASE="${HOME}/papers_slides"
+INBOX_MD="${INBOX_MD_BASE}/quick_notes.md"
+PPT_OUTDIR="${PPT_OUTDIR_BASE}"
+PPT_DECK_DEFAULT="${PAPERFLOW_PPT_DECK:-}"
+TMPDIR="${HOME}/.cache/paperflow"
+PY_SCRIPT="${HOME}/.local/bin/make_paper_slide.py"
+mkdir -p "$INBOX_MD_BASE" "$PPT_OUTDIR_BASE" "$TMPDIR"
+
+usage () {
+  cat <<'EOF'
+paperflow <DOI_or_URL_or_PDF> [options]
+
+最短例:
+  paperflow 10.1145/3292500.3330645 -n "BERTの元論文" -r "復習" -u "スライド化"
+
+オプション:
+  -l, --library NAME       → papis のライブラリ（papis -l NAME add ...）
+                             指定時、出力先も NAME に自動切替：
+                               MD : ~/papers_inbox/NAME/quick_notes.md
+                               PPT: ~/papers_slides/NAME/ （--deck未指定なら paperdeck.pptx に追記）
+  --pdf PATHS              → 添付PDF（カンマ区切り/複数回OK）
+  --theme PATH             → PPTテーマpptx（既定: $PAPERFLOW_PPT_THEME）
+  --layout N               → テーマ内レイアウト番号（既定: $PAPERFLOW_PPT_LAYOUT）
+  -r, --reason TXT         → Relevance（関連性）
+  -u, --usage  TXT         → Application（活用）/ Implication（含意）
+  -t, --tags  CSV          → 例: "CHO,stability"
+  -n, --name  TXT          → タイトル（指定が最優先）
+      --deck PATH          → 単一PPTに追記保存（指定時はこれを最優先）
+      --no-ppt             → PPT作成スキップ
+      --no-papis           → Papis登録スキップ
+  -h, --help               → このヘルプ
+      --version            → バージョン表示
+
+環境変数（任意）:
+  PAPERFLOW_PPT_PYTHON / PAPERFLOW_PAPIS_BIN / PAPERFLOW_PAPIS_PYTHON
+  PAPERFLOW_PPT_THEME   → 既定のテーマpptx
+  PAPERFLOW_PPT_LAYOUT  → 既定レイアウト番号（例: 1 = タイトル＋本文）
+  PAPERFLOW_PPT_DECK    → 既定のデッキ（-l 時は NAME/paperdeck.pptx）
+  PAPERFLOW_LABEL_REL   → Relevance のラベル（既定: "Relevance"）
+  PAPERFLOW_LABEL_APP   → Application のラベル（既定: "Application"）
+
+※ 位置引数（DOI/URL/PDFパス）はオプションの前後どちらでも指定できます。
+EOF
+}
+
+# ===== 事前処理 =====
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help) usage; exit 0;;
+    --version) echo "paperflow v0.9"; exit 0;;
+  esac
+done
+
+# ===== ラベル =====
+REL_LABEL="${PAPERFLOW_LABEL_REL:-Relevance}"
+APP_LABEL="${PAPERFLOW_LABEL_APP:-Application}"
+
+# ===== 引数パース =====
+ID_OR_URL=""
+REASON=""; USAGE_NOTE=""; TAGS=""; CUSTOM_TITLE=""
+LIBRARY=""; THEME="${PAPERFLOW_PPT_THEME:-}"; LAYOUT="${PAPERFLOW_PPT_LAYOUT:-1}"
+NO_PPT=0; NO_PAPIS=0
+PPT_DECK_DEFAULT="${PAPERFLOW_PPT_DECK:-}"
+DECK="${PPT_DECK_DEFAULT}"; DECK_SRC="env"  # env / cli / none / auto
+[[ -z "$DECK" ]] && DECK_SRC="none"
+PDFS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -l|--library)  shift; LIBRARY="${1:-}";;
+    --pdf)         shift; IFS=',' read -r -a _arr <<< "${1:-}"; PDFS+=("${_arr[@]}");;
+    --theme)       shift; THEME="${1:-}";;
+    --layout)      shift; LAYOUT="${1:-}";;
+    -r|--reason)   shift; REASON="${1:-}";;
+    -u|--usage)    shift; USAGE_NOTE="${1:-}";;
+    -t|--tags)     shift; TAGS="${1:-}";;
+    -n|--name)     shift; CUSTOM_TITLE="${1:-}";;
+    --deck)        shift; DECK="${1:-}"; DECK_SRC="cli";;
+    --no-ppt)      NO_PPT=1;;
+    --no-papis)    NO_PAPIS=1;;
+    --)            shift; break;;
+    -* ) echo "Unknown option: $1"; echo; usage; exit 1;;
+    *  ) if [[ -z "${ID_OR_URL}" ]]; then ID_OR_URL="$1"; else
+            echo "Warning: extra argument ignored: $1"
+          fi
+          ;;
+  esac
+  shift || true
+done
+
+if [[ -z "${ID_OR_URL}" && $# -gt 0 ]]; then ID_OR_URL="$1"; shift || true; fi
+if [[ -z "${ID_OR_URL}" ]]; then usage; exit 2; fi
+
+timestamp="$(date '+%Y-%m-%d %H:%M')"
+safe() { echo "$1" | tr '/ ' '__' | tr -d '"' ; }
+file_url () { local p="$1"; [[ "$p" == /* ]] && { p="${p// /%20}"; echo "file://${p}"; } || echo "$1"; }
+
+# ===== ライブラリ指定時の出力先自動切替 =====
+if [[ -n "$LIBRARY" ]]; then
+  INBOX_MD="${INBOX_MD_BASE}/${LIBRARY}/quick_notes.md"
+  PPT_OUTDIR="${PPT_OUTDIR_BASE}/${LIBRARY}"
+  if [[ "$DECK_SRC" != "cli" ]]; then
+    DECK="${PPT_OUTDIR}/paperdeck.pptx"
+    DECK_SRC="auto"
+  fi
+fi
+
+# ===== 入力がローカルPDFならPDFSに追加 =====
+if [[ -f "$ID_OR_URL" ]]; then
+  case "$ID_OR_URL" in *.pdf|*.PDF) PDFS+=("$ID_OR_URL");; esac
+fi
+# 実在チェック＆重複除去
+dedup_pdf=()
+for p in "${PDFS[@]}"; do
+  [[ -f "$p" ]] || continue
+  case " ${dedup_pdf[*]} " in *" $p "*) ;; *) dedup_pdf+=("$p");; esac
+done
+PDFS=("${dedup_pdf[@]}")
+
+# ===== タイトル解決（Markdown/PPTより先に！） =====
+BIBFILE="${TMPDIR}/$(safe "$ID_OR_URL").bib"
+rm -f "$BIBFILE" || true
+
+fetch_bib () {
+  local id="$1"
+  if [[ "$id" =~ ^10\. ]]; then
+    curl -sL -H "Accept: application/x-bibtex" "https://doi.org/${id}" -o "$BIBFILE" || true
+  elif [[ "$id" == *"arxiv.org"* ]]; then
+    local aid
+    aid="$(echo "$id" | rg -o 'arxiv\.org/(abs|pdf)/([0-9]+\.[0-9]+)(v[0-9]+)?' -r '$2$3' | head -n1)"
+    [[ -n "$aid" ]] && curl -sL "https://arxiv.org/bibtex/${aid}" -o "$BIBFILE" || true
+  fi
+}
+
+# DOI / arXiv の場合は先にBibTeXを取得
+if [[ "$ID_OR_URL" =~ ^10\. || "$ID_OR_URL" == *"arxiv.org"* ]]; then
+  fetch_bib "$ID_OR_URL"
+fi
+
+# BibTeXから title を抽出（{...} と "..." の両方対応・大小無視）
+TITLE_FROM_BIB=""
+if [[ -s "$BIBFILE" ]]; then
+  TITLE_FROM_BIB="$( rg -io 'title\s*=\s*\{([^}]*)\}' -r '$1' "$BIBFILE" | head -n1 || true )"
+  [[ -z "$TITLE_FROM_BIB" ]] && TITLE_FROM_BIB="$( rg -io 'title\s*=\s*"([^"]*)"' -r '$1' "$BIBFILE" | head -n1 || true )"
+fi
+
+# PDFのみの時のフォールバック
+TITLE_FALLBACK=""
+if [[ -z "$TITLE_FROM_BIB" && -f "$ID_OR_URL" ]]; then
+  TITLE_FALLBACK="$(basename "$ID_OR_URL" | sed 's/\.[Pp][Dd][Ff]$//')"
+fi
+
+RESOLVED_TITLE="${CUSTOM_TITLE:-${TITLE_FROM_BIB:-${TITLE_FALLBACK:-}}}"
+[[ -z "$RESOLVED_TITLE" ]] && RESOLVED_TITLE="(title pending)"
+
+# ===== リンク（Markdown/PPT共通） =====
+if [[ "$ID_OR_URL" =~ ^10\. ]]; then
+  LINK="https://doi.org/${ID_OR_URL}"
+elif [[ -f "$ID_OR_URL" ]]; then
+  LINK="$(file_url "$ID_OR_URL")"
+else
+  LINK="$ID_OR_URL"
+fi
+
+# ---- 1) Markdown 追記（解決済みタイトルを使用） ----
+mkdir -p "$(dirname "$INBOX_MD")"; touch "$INBOX_MD"
+{
+  echo "- [${RESOLVED_TITLE}](${LINK})"
+  [[ -n "$REASON" ]] && echo "    - ${REL_LABEL}: ${REASON}"
+  [[ -n "$USAGE_NOTE" ]] && echo "    - ${APP_LABEL}: ${USAGE_NOTE}"
+  [[ -n "$TAGS" ]] && echo "    - tags: [${TAGS}]"
+  for _pdf in "${PDFS[@]}"; do echo "    - file: ${_pdf}"; done
+  [[ -n "$LIBRARY" ]] && echo "    - library: ${LIBRARY}"
+  echo "    - added: ${timestamp}"
+  echo ""
+} >> "$INBOX_MD"
+echo "✓ Markdownに追記: $INBOX_MD"
+
+# ---- 2) BibTeX（不足時は自動生成）→ Papis登録 ----
+papis_add_bib () {
+  local cmd=()
+  if [[ -x "$PAPIS_BIN" ]]; then
+    if [[ -n "$LIBRARY" ]]; then
+      cmd=("$PAPIS_BIN" -l "$LIBRARY" add --from bibtex "$BIBFILE")
+    else
+      cmd=("$PAPIS_BIN" add --from bibtex "$BIBFILE")
+    fi
+  elif [[ -x "$PAPIS_PYTHON" ]]; then
+    if [[ -n "$LIBRARY" ]]; then
+      cmd=("$PAPIS_PYTHON" -m papis -l "$LIBRARY" add --from bibtex "$BIBFILE")
+    else
+      cmd=("$PAPIS_PYTHON" -m papis add --from bibtex "$BIBFILE")
+    fi
+  else
+    echo "… Papis環境が見つからないため登録スキップ。"
+    return 2
+  fi
+
+  [[ -n "$TAGS" ]]       && cmd+=("--set" "tags"  "$TAGS")
+  [[ -n "$REASON" ]]     && cmd+=("--set" "reason" "$REASON")
+  [[ -n "$USAGE_NOTE" ]] && cmd+=("--set" "usage"  "$USAGE_NOTE")
+  cmd+=("--set" "added" "$timestamp")
+  if [[ ${#PDFS[@]} -gt 0 ]]; then cmd+=("${PDFS[@]}"); fi
+
+  if "${cmd[@]}"; then
+    echo "✓ Papisに登録（bibtex${LIBRARY:+ / -l $LIBRARY}${#PDFS[@]}:+ / ${#PDFS[@]} file(s)}）"
+    return 0
+  else
+    echo "… Papis登録に失敗（コマンド実行エラー）"
+    return 1
+  fi
+}
+
+# BibTeXが無い/空なら最小Bibを生成（解決済みタイトルを使用）
+if [[ ! -s "$BIBFILE" ]]; then
+  KEY="inbox$(date +%s)"
+  {
+    echo "@misc{$KEY,"
+    [[ -n "$RESOLVED_TITLE" ]] && echo "  title = {$RESOLVED_TITLE},"
+    [[ "$ID_OR_URL" =~ ^10\. ]] && echo "  doi = {$ID_OR_URL},"
+    echo "  howpublished = {\\url{$LINK}},"
+    echo "  note = {from paperflow},"
+    echo "  year = {$(date +%Y)}"
+    echo "}"
+  } > "$BIBFILE"
+fi
+
+if [[ ${NO_PAPIS} -eq 0 ]]; then
+  papis_add_bib || true
+fi
+
+# ---- 3) PPT 1枚（単一デッキに追記も可） ----
+if [[ $NO_PPT -eq 0 ]]; then
+  if [[ ! -f "$PY_SCRIPT" ]]; then
+    echo "× PPTスクリプトが見つかりません: $PY_SCRIPT"
+  else
+    mkdir -p "$PPT_OUTDIR"
+    TITLE_ARG="${RESOLVED_TITLE}"
+
+    run_ppt () {
+      local py="$1"
+      "$py" "$PY_SCRIPT" \
+        --title "$TITLE_ARG" \
+        --link "$LINK" \
+        ${REASON:+--reason "$REASON"} \
+        ${USAGE_NOTE:+--usage "$USAGE_NOTE"} \
+        --rel-label "$REL_LABEL" \
+        --app-label "$APP_LABEL" \
+        ${DECK:+--deck "$DECK"} \
+        ${THEME:+--theme "$THEME"} \
+        --layout "$LAYOUT" \
+        --outdir "$PPT_OUTDIR"
+    }
+
+    if run_ppt "$PPT_PYTHON"; then
+      echo "✓ PPT ${DECK:+(deck: $DECK) }に追記/作成"
+    elif run_ppt "$PAPIS_PYTHON"; then
+      echo "✓ PPT（fallback） ${DECK:+(deck: $DECK) }に追記/作成"
+    else
+      echo "× PPTの作成に失敗"
+      exit 1
+    fi
+  fi
+fi
+
+echo "All done. 🎯"
